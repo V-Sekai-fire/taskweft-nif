@@ -56,8 +56,12 @@ defmodule Taskweft do
   alias Taskweft.NIF
   alias Taskweft.ReBAC
 
-  def plan(domain_json, origin_iso \\ "PT0S") do
-    {:ok, NIF.plan_with_temporal(domain_json, origin_iso)}
+  def plan(domain_json, origin_iso \\ "PT0S", reference_date \\ "") do
+    if reference_date == "" do
+      {:ok, NIF.plan_with_temporal(domain_json, origin_iso)}
+    else
+      {:ok, NIF.plan_with_temporal_civil(domain_json, origin_iso, reference_date)}
+    end
   rescue
     e -> {:error, Exception.message(e)}
   end
@@ -68,8 +72,12 @@ defmodule Taskweft do
     e -> {:error, Exception.message(e)}
   end
 
-  def check_temporal(domain_json, plan_json, origin_iso \\ "PT0S") do
-    {:ok, NIF.check_temporal(domain_json, plan_json, origin_iso)}
+  def check_temporal(domain_json, plan_json, origin_iso \\ "PT0S", reference_date \\ "") do
+    if reference_date == "" do
+      {:ok, NIF.check_temporal(domain_json, plan_json, origin_iso)}
+    else
+      {:ok, NIF.check_temporal_civil(domain_json, plan_json, origin_iso, reference_date)}
+    end
   rescue
     e -> {:error, Exception.message(e)}
   end

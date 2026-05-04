@@ -6,7 +6,9 @@
 // fractions on lowest-order unit only, integer millisecond arithmetic.
 #pragma once
 #include "tw_domain.hpp"
+#include "thirdparty/date/date.h"
 #include <cstdint>
+#include <optional>
 #include <sstream>
 #include <limits>
 #include <string>
@@ -256,6 +258,207 @@ inline TwTemporalResult tw_check_temporal(
         if (dit != domain.action_durations.end()) {
             dur_iso       = dit->second;
             int64_t parsed = tw_parse_duration_ms(dur_iso);
+            if (parsed >= 0) dur_ms = parsed;
+        }
+
+        TwTemporalStep step;
+        step.action_name  = name;
+        step.duration_iso = dur_iso.empty() ? "PT0S" : dur_iso;
+        step.start_iso    = tw_format_duration_ms(current);
+        step.end_iso      = tw_format_duration_ms(current + dur_ms);
+        r.steps.push_back(std::move(step));
+
+        current  += dur_ms;
+        total_ms += dur_ms;
+
+        double dur_s    = static_cast<double>(dur_ms) / 1000.0;
+        std::string a_s = "a" + std::to_string(i) + "_start";
+        std::string a_e = "a" + std::to_string(i) + "_end";
+        stn.add_constraint(prev_end, a_s, 0.0, 0.0);
+        stn.add_constraint(a_s,      a_e, dur_s, dur_s);
+        prev_end = a_e;
+    }
+
+    r.consistent = stn.consistent();
+    r.total_iso  = tw_format_duration_ms(total_ms);
+    return r;
+}
+
+// ── Civil-time layer (uses Hinnant date.h) ────────────────────────────────────
+//
+// tw_parse_duration_ms uses Timex fixed-day conventions (1Y=365d, 1Mo=30d).
+// The civil-time layer replaces Y and Mo with actual calendar arithmetic so
+// P1Y from 2024-01-01 = 366 d (leap year) and P1M from 2024-01-31 = 29 d
+// (February 2024).  W, D, H, Mi, S retain their fixed values.
+
+// Parse "YYYY-MM-DD" (or "YYYY-MM-DDT..." — time part ignored).
+// Returns nullopt on any format or range error.
+inline std::optional<date::year_month_day> tw_parse_date(const std::string &s) {
+    if (s.size() < 10 || s[4] != '-' || s[7] != '-') return std::nullopt;
+    int y = 0, m = 0, d = 0;
+    for (int i = 0; i < 4; ++i) {
+        if (!std::isdigit((unsigned char)s[i])) return std::nullopt;
+        y = y * 10 + (s[i] - '0');
+    }
+    for (int i = 5; i < 7; ++i) {
+        if (!std::isdigit((unsigned char)s[i])) return std::nullopt;
+        m = m * 10 + (s[i] - '0');
+    }
+    for (int i = 8; i < 10; ++i) {
+        if (!std::isdigit((unsigned char)s[i])) return std::nullopt;
+        d = d * 10 + (s[i] - '0');
+    }
+    date::year_month_day ymd =
+        date::year{y} / date::month{(unsigned)m} / date::day{(unsigned)d};
+    if (!ymd.ok()) return std::nullopt;
+    return ymd;
+}
+
+// Civil-time-aware duration → milliseconds.
+// `cursor` is the current civil date; it is advanced in-place for Y and Mo
+// components so that successive calls accumulate correctly through a plan.
+//
+// Fractions on Y/Mo fall back to fixed unit_ms (calendar fractions are
+// ambiguous; this matches the Timex convention for sub-unit precision).
+// Returns -1 on any parse error (same contract as tw_parse_duration_ms).
+inline int64_t tw_civil_duration_ms(const std::string &dur,
+                                     date::year_month_day &cursor) {
+    using namespace tw_duration_detail;
+    using namespace date;
+    if (dur.empty() || dur[0] != 'P') return -1;
+    if (dur.size() == 1) return 0;
+
+    size_t  i         = 1;
+    int64_t total_ms  = 0;
+    bool    in_time   = false;
+    bool    saw_t     = false;
+    bool    frac_seen = false;
+    bool    saw_w     = false;
+    bool    saw_any   = false;
+    int     last_rank = -1;
+
+    while (i < dur.size()) {
+        if (frac_seen) return -1;
+
+        if (dur[i] == 'T') {
+            if (saw_t) return -1;
+            if (i + 1 >= dur.size()) return -1;
+            saw_t = true; in_time = true; ++i; continue;
+        }
+
+        if (!std::isdigit((unsigned char)dur[i])) return -1;
+
+        int64_t whole = 0;
+        while (i < dur.size() && std::isdigit((unsigned char)dur[i]))
+            whole = whole * 10 + (dur[i++] - '0');
+
+        int64_t frac_milli = 0;
+        bool    has_frac   = false;
+        if (i < dur.size() && dur[i] == '.') {
+            ++i;
+            if (i >= dur.size() || !std::isdigit((unsigned char)dur[i])) return -1;
+            has_frac = true;
+            int64_t acc = 0, n = 0;
+            while (i < dur.size() && std::isdigit((unsigned char)dur[i]) && n < 3)
+                acc = acc * 10 + (dur[i++] - '0'), ++n;
+            while (i < dur.size() && std::isdigit((unsigned char)dur[i])) ++i;
+            for (int64_t k = n; k < 3; ++k) acc *= 10;
+            frac_milli = acc;
+        }
+
+        if (i >= dur.size()) return -1;
+        char unit_c = dur[i++];
+
+        int     rank;
+        int64_t unit_ms_fixed;
+        if (!in_time) {
+            if      (unit_c == 'Y') { rank = 0;  unit_ms_fixed = MS_Y;  }
+            else if (unit_c == 'M') { rank = 1;  unit_ms_fixed = MS_MO; }
+            else if (unit_c == 'W') { rank = 99; unit_ms_fixed = MS_W;  }
+            else if (unit_c == 'D') { rank = 2;  unit_ms_fixed = MS_D;  }
+            else return -1;
+        } else {
+            if      (unit_c == 'H') { rank = 3; unit_ms_fixed = MS_H;  }
+            else if (unit_c == 'M') { rank = 4; unit_ms_fixed = MS_MI; }
+            else if (unit_c == 'S') { rank = 5; unit_ms_fixed = MS_S;  }
+            else return -1;
+        }
+
+        if (unit_c == 'W' && (saw_any || in_time)) return -1;
+        if (saw_w) return -1;
+        if (unit_c == 'W') saw_w = true;
+        if (rank != 99 && rank <= last_rank) return -1;
+        last_rank = (rank == 99) ? last_rank : rank;
+
+        // Y and Mo: calendar arithmetic via date.h
+        if (!in_time && (unit_c == 'Y' || unit_c == 'M') && cursor.ok()) {
+            auto from_sys = sys_days{cursor};
+            if (unit_c == 'Y') {
+                cursor = year_month_day{
+                    cursor.year() + years{(int)whole}, cursor.month(), cursor.day()};
+            } else {
+                cursor = year_month_day{
+                    cursor.year(), cursor.month() + months{(int)whole}, cursor.day()};
+            }
+            // Clamp day to last valid day of the resulting month (e.g. Jan 31 + 1Mo → Feb 28/29)
+            if (!cursor.ok())
+                cursor = cursor.year() / cursor.month() / last;
+            int64_t days = (sys_days{cursor} - from_sys).count();
+            total_ms += days * 86400LL * 1000;
+            // Fractions on Y/Mo: fixed fallback (calendar fractions are ambiguous)
+            if (has_frac) total_ms += frac_milli * (unit_ms_fixed / 1000);
+        } else {
+            total_ms += whole * unit_ms_fixed;
+            if (has_frac) total_ms += frac_milli * (unit_ms_fixed / 1000);
+        }
+
+        if (has_frac) frac_seen = true;
+        saw_any = true;
+    }
+
+    return total_ms;
+}
+
+// Civil-time-aware temporal check.  Identical to tw_check_temporal except:
+//   - reference_date "YYYY-MM-DD": Y and Mo durations use calendar arithmetic.
+//   - reference_date "": falls back to tw_parse_duration_ms (Timex fixed days).
+// The civil cursor accumulates through the plan so that each action's Y/Mo
+// duration is measured from the civil date at which that action starts.
+inline TwTemporalResult tw_check_temporal_civil(
+        const std::vector<TwCall> &plan,
+        const TwDomain            &domain,
+        const std::string         &origin_iso     = "PT0S",
+        const std::string         &reference_date = "") {
+    TwTemporalResult r;
+    r.consistent = true;
+    r.origin_iso = origin_iso;
+
+    std::optional<date::year_month_day> civil_cursor;
+    if (!reference_date.empty())
+        civil_cursor = tw_parse_date(reference_date);
+
+    int64_t origin_ms = tw_parse_duration_ms(origin_iso);
+    if (origin_ms < 0) origin_ms = 0;
+
+    if (plan.empty()) { r.total_iso = "PT0S"; return r; }
+
+    tw_detail::STN stn;
+    stn.add_point("t0");
+    std::string prev_end = "t0";
+    int64_t current  = origin_ms;
+    int64_t total_ms = 0;
+
+    for (size_t i = 0; i < plan.size(); ++i) {
+        const std::string &name = plan[i].name;
+
+        int64_t     dur_ms  = 0;
+        std::string dur_iso;
+        auto dit = domain.action_durations.find(name);
+        if (dit != domain.action_durations.end()) {
+            dur_iso = dit->second;
+            int64_t parsed = (civil_cursor && civil_cursor->ok())
+                ? tw_civil_duration_ms(dur_iso, *civil_cursor)
+                : tw_parse_duration_ms(dur_iso);
             if (parsed >= 0) dur_ms = parsed;
         }
 

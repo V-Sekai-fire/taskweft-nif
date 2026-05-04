@@ -9,58 +9,133 @@
 #include <unordered_map>
 #include <vector>
 
-// Parse ISO 8601 time-duration string (PTxHxMxS) → total seconds.
-// Only handles the time part (PT prefix); day/year/month not supported.
-// Returns -1.0 on parse failure.
+// Parse ISO 8601 duration string → total seconds. Spec is the Lean module
+// `lean/Planner/Iso8601Duration.lean` in multiplayer-fabric-taskweft, which
+// in turn mirrors `Timex.Parse.Duration.Parsers.ISO8601Parser` byte-for-byte:
+// grammar, error cases, and UTC-elapsed unit normalisation
+// (Y=365d, M-before-T=30d, W=7d, D=86400s). Civil time is out of scope.
+//
+// Recognised: PnY nM nW nD T nH nM nS, with `T` toggling date→time state.
+// `M` before `T` is months; `M` after `T` is minutes. Fractional digits
+// only allowed on `S` (Lean spec restriction). `P` alone is the zero
+// duration. Returns -1.0 on any spec violation.
 inline double tw_parse_duration(const std::string &dur) {
-    if (dur.size() < 2 || dur[0] != 'P') return -1.0;
-    size_t i = 1;
-    // Skip optional 'T' time designator
-    if (i < dur.size() && dur[i] == 'T') ++i;
-    double total = 0.0;
+    if (dur.empty())     return -1.0;
+    if (dur[0] != 'P')   return -1.0;
+    if (dur.size() == 1) return 0.0;              // "P" alone = zero
+
+    size_t  i        = 1;
+    bool    in_time  = false;
+    bool    saw_t    = false;
+    bool    saw_w    = false;
+    bool    saw_other= false;
+    int64_t total_ms = 0;
+
     while (i < dur.size()) {
-        double val = 0.0;
-        bool has_digit = false;
-        // Integer part
-        while (i < dur.size() && std::isdigit((unsigned char)dur[i])) {
-            has_digit = true;
-            val = val * 10.0 + (dur[i++] - '0');
+        char c = dur[i];
+
+        if (c == 'T') {
+            if (saw_t)              return -1.0; // duplicate T
+            if (i + 1 >= dur.size())return -1.0; // T at end
+            in_time = true;
+            saw_t   = true;
+            ++i;
+            continue;
         }
-        // Fractional part
+
+        if (!std::isdigit((unsigned char)c)) return -1.0; // unexpected token
+
+        // Integer part.
+        int64_t whole = 0;
+        while (i < dur.size() && std::isdigit((unsigned char)dur[i])) {
+            whole = whole * 10 + (dur[i] - '0');
+            ++i;
+        }
+
+        // Optional fractional part — first 3 digits accumulated as
+        // milliseconds, any further digits consumed but discarded
+        // (matches the Lean spec's bounded precision).
+        int64_t frac_ms = 0;
+        bool    had_frac = false;
         if (i < dur.size() && dur[i] == '.') {
             ++i;
-            double frac = 0.1;
+            had_frac = true;
+            int n = 0;
             while (i < dur.size() && std::isdigit((unsigned char)dur[i])) {
-                val += (dur[i++] - '0') * frac;
-                frac *= 0.1;
+                if (n < 3) {
+                    frac_ms = frac_ms * 10 + (dur[i] - '0');
+                    ++n;
+                }
+                ++i;
+            }
+            for (int k = n; k < 3; ++k) frac_ms *= 10;
+        }
+
+        if (i >= dur.size()) return -1.0; // number with no unit
+
+        char unit_c = dur[i++];
+
+        // W is the basic-form-only unit and may not coexist with anything.
+        if (unit_c == 'W' && (saw_other || in_time))           return -1.0;
+        if (unit_c != 'W' && unit_c != 'T' && saw_w)           return -1.0;
+
+        // Fractional only allowed on S (Lean spec).
+        if (had_frac && unit_c != 'S')                          return -1.0;
+
+        int64_t unit_ms = 0;
+        if (in_time) {
+            switch (unit_c) {
+                case 'H': unit_ms = 3600LL * 1000;        saw_other = true; break;
+                case 'M': unit_ms =   60LL * 1000;        saw_other = true; break;
+                case 'S': unit_ms =          1000;        saw_other = true; break;
+                case 'Y': case 'D':                       return -1.0; // dateAfterT
+                default:                                  return -1.0; // unexpected
+            }
+        } else {
+            switch (unit_c) {
+                case 'Y': unit_ms = 365LL * 86400 * 1000; saw_other = true; break;
+                case 'M': unit_ms =  30LL * 86400 * 1000; saw_other = true; break;
+                case 'W': unit_ms =   7LL * 86400 * 1000; saw_w     = true; break;
+                case 'D': unit_ms =          86400 * 1000;saw_other = true; break;
+                case 'H': case 'S':                       return -1.0; // timeBeforeT
+                default:                                  return -1.0; // unexpected
             }
         }
-        if (!has_digit || i >= dur.size()) break;
-        char unit = dur[i++];
-        if      (unit == 'H') total += val * 3600.0;
-        else if (unit == 'M') total += val * 60.0;
-        else if (unit == 'S') total += val;
+
+        total_ms += whole * unit_ms + (unit_c == 'S' ? frac_ms : 0);
     }
-    return total;
+
+    return static_cast<double>(total_ms) / 1000.0;
 }
 
-// Format total seconds → ISO 8601 duration string (PTxHxMxS).
+// Format total seconds → ISO 8601 duration string. Whole-day spans render
+// as PnD; sub-day remainders render as the time part PTnHnMnS. PT0S for zero.
 inline std::string tw_format_duration(double seconds) {
     if (seconds < 0.0) seconds = 0.0;
-    int h = (int)(seconds / 3600.0);
-    seconds -= h * 3600.0;
-    int m = (int)(seconds / 60.0);
-    seconds -= m * 60.0;
 
-    std::string s = "PT";
+    int    days = static_cast<int>(seconds / 86400.0);
+    double rem  = seconds - days * 86400.0;
+    int    h    = static_cast<int>(rem / 3600.0);
+    rem        -= h * 3600.0;
+    int    m    = static_cast<int>(rem / 60.0);
+    rem        -= m * 60.0;
+
+    bool no_time = (h == 0 && m == 0 && rem == 0.0);
+    std::string s = "P";
+    if (days > 0) s += std::to_string(days) + "D";
+    if (no_time) {
+        if (days == 0) s += "T0S";
+        return s;
+    }
+    s += "T";
     if (h > 0) s += std::to_string(h) + "H";
     if (m > 0) s += std::to_string(m) + "M";
-    if (seconds > 0.0 || (h == 0 && m == 0)) {
-        if (seconds == (double)(int)seconds)
-            s += std::to_string((int)seconds) + "S";
+    if (rem > 0.0) {
+        if (rem == static_cast<double>(static_cast<int>(rem)))
+            s += std::to_string(static_cast<int>(rem)) + "S";
         else {
             char buf[32];
-            std::snprintf(buf, sizeof(buf), "%.6gS", seconds);
+            std::snprintf(buf, sizeof(buf), "%.6gS", rem);
             s += buf;
         }
     }

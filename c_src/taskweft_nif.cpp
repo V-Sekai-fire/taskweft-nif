@@ -161,6 +161,41 @@ std::string plan_with_temporal(ErlNifEnv *p_env, std::string p_domain_json,
 }
 FINE_NIF(plan_with_temporal, 0);
 
+// check_temporal_civil(domain_json, plan_json, origin_iso, reference_date) → temporal_result_json
+// reference_date: "YYYY-MM-DD" — Y and Mo durations use actual calendar days.
+// Passes "" to fall back to Timex fixed-day conventions (same as check_temporal).
+std::string check_temporal_civil(ErlNifEnv *p_env, std::string p_domain_json,
+		std::string p_plan_json, std::string p_origin_iso, std::string p_reference_date) {
+	TwLoader::TwLoaded loaded = load_cached(p_domain_json);
+	if (!loaded.state) {
+		throw std::runtime_error("failed_to_load_domain");
+	}
+	std::vector<TwCall> plan_vec = parse_plan(p_plan_json);
+	TwTemporalResult tr = tw_check_temporal_civil(plan_vec, loaded.domain,
+			p_origin_iso, p_reference_date);
+	return tw_temporal_to_json(plan_vec, tr, TwLoader::plan_to_json(plan_vec));
+}
+FINE_NIF(check_temporal_civil, 0);
+
+// plan_with_temporal_civil(domain_json, origin_iso, reference_date) → plan_with_temporal_json
+// Combines plan() + check_temporal_civil() in one NIF call.
+std::string plan_with_temporal_civil(ErlNifEnv *p_env, std::string p_domain_json,
+		std::string p_origin_iso, std::string p_reference_date) {
+	TwLoader::TwLoaded loaded = load_cached(p_domain_json);
+	if (!loaded.state) {
+		throw std::runtime_error("failed_to_load_domain");
+	}
+	std::optional<std::vector<TwCall>> result = tw_plan(loaded.state, loaded.tasks, loaded.domain);
+	if (!result) {
+		throw std::runtime_error("no_plan");
+	}
+	std::string plan_json = TwLoader::plan_to_json(*result);
+	TwTemporalResult tr = tw_check_temporal_civil(*result, loaded.domain,
+			p_origin_iso, p_reference_date);
+	return tw_temporal_to_json(*result, tr, plan_json);
+}
+FINE_NIF(plan_with_temporal_civil, 0);
+
 // domain_cache_clear() → :ok
 // Evicts all cached parsed domains. Call when domain JSON will not be reused.
 std::string domain_cache_clear(ErlNifEnv *p_env) {

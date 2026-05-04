@@ -35,8 +35,10 @@ defmodule Taskweft.NIF do
 
   def plan(_domain_json), do: :erlang.nif_error(:not_loaded)
   def plan_with_temporal(_domain_json, _origin_iso), do: :erlang.nif_error(:not_loaded)
+  def plan_with_temporal_civil(_domain_json, _origin_iso, _reference_date), do: :erlang.nif_error(:not_loaded)
   def replan(_domain_json, _plan_json, _fail_step), do: :erlang.nif_error(:not_loaded)
   def check_temporal(_domain_json, _plan_json, _origin_iso), do: :erlang.nif_error(:not_loaded)
+  def check_temporal_civil(_domain_json, _plan_json, _origin_iso, _reference_date), do: :erlang.nif_error(:not_loaded)
 
   def rebac_add_edge(_graph_json, _subj, _obj, _rel), do: :erlang.nif_error(:not_loaded)
   def rebac_check(_graph_json, _subj, _expr_json, _obj, _fuel), do: :erlang.nif_error(:not_loaded)
